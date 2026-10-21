@@ -53,15 +53,29 @@ leaves your machine.
 
 ## Local test results
 
-The seed + entrypoint were validated end-to-end against the real upstream
-build before this repo was written:
+Validated in a real Docker container built from this repo, using a
+root-owned 0600 secret mount that reproduces Render's exact permissions.
 
 | Check | Result |
 |---|---|
-| Seed boots, no decryption errors | 16 connections, 16 credential fields re-encrypted and round-trip verified |
-| Auth enforced | 401 on unauthenticated `/v1/models` and `/api/providers` |
-| Migrated API key authenticates | 200, **2,873 models** |
-| Live inference via a re-encrypted credential | `qoder/glm-5.2` → 200, `"content":"PONG"` |
-| `OMNIROUTE_API_KEY` env mechanism | 200, all 16 connections visible with `manage` scope |
-| **Rehydrate from a wiped `DATA_DIR`** | wipe → restore → healthy → 2871 models → inference `"PONG"` again |
-| Startup with health check disabled | ~6 s to healthy (vs ~20 s with it on) |
+| Container build | succeeds on `diegosouzapw/omniroute:3.8.52` |
+| Boot | seed restored → 6 secrets loaded → privileges dropped to uid 1000 → ready |
+| Container health | `healthy` |
+| `/healthz` | 200 |
+| `/v1/models` unauthenticated | 401 |
+| `/v1/models` with a migrated key | 200, 1,516 models |
+| `/api/providers` | 200, all 16 connections |
+| Dashboard login (right / wrong password) | 200 / 401 |
+| Live inference via a re-encrypted credential | `agentrouter/deepseek-v4-flash` → 200, `"content":"PONG"` |
+| Memory | 385 MB resident (fits the 512 MB tier) |
+| **Cold start** (container destroyed, fresh FS) | rehydrates identically |
+
+Two findings from that testing are baked into the code:
+
+- The container **starts as root** and drops to uid 1000 via `setpriv`.
+  Render mounts secret files root-only readable, and the upstream image runs
+  as `node` — so a container started as `node` cannot read its own secrets
+  and boots with an empty database.
+- The entrypoint **removes any existing `storage.sqlite`** (and its
+  `-wal`/`-shm`) before restoring, so a failed restore can never silently
+  leave stale data in place.

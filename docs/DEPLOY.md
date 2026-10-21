@@ -95,6 +95,16 @@ Render dashboard → your service → **Secret Files** → **Add**:
 Combined size must stay under **1 MB** — the seed is ~231 KB, so there is
 plenty of room.
 
+**Or upload them with the API** (needs an API key from
+[dashboard.render.com/account/api-keys](https://dashboard.render.com/account/api-keys)):
+
+```powershell
+$env:RENDER_API_KEY = 'rnd_...'
+node tools/upload-secrets.mjs --name omniroute-render
+```
+
+Add `--dry-run` first to check the sizes without uploading.
+
 > `server.env` must contain `STORAGE_ENCRYPTION_KEY`. Without it the server
 > refuses to boot rather than silently wiping your credentials, because it
 > detects encrypted rows it cannot decrypt.
@@ -102,6 +112,14 @@ plenty of room.
 **Before you upload, set a strong `INITIAL_PASSWORD` in `server.env`.** Open
 the file and replace the generated placeholder. That password is the only
 thing protecting the dashboard on a public URL.
+
+> **Note on file permissions.** Render mounts secret files owned by root with
+> mode 0600, so only root can read them — and the upstream image runs the
+> server as the non-root `node` user. This is why `Dockerfile` starts the
+> container as root and `entrypoint.sh` drops privileges to uid 1000 after
+> reading the secrets. If you fork this deploy, keep that behaviour: a
+> container that starts as `node` cannot read its own secret files and will
+> boot with an empty database.
 
 ---
 
@@ -176,9 +194,11 @@ harmless even with a persistent disk.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Log shows `Refusing to auto-generate STORAGE_ENCRYPTION_KEY` | `server.env` missing or lacks the key | Re-upload `server.env` |
+| Log shows `WARNING: /etc/secrets/seed.b64 not found` | The secret file is not attached, or the container is running as a user that cannot read it | Check the Secret Files list. The image must start as root (it does — `entrypoint.sh` drops to uid 1000 after reading) |
 | Boot succeeds but `/v1/models` returns an empty list | Seed restore failed silently | Check the log for the `[entrypoint] restored seed database` line. A leftover `-wal`/`-shm` is the usual cause; the entrypoint removes them, but check `DATA_DIR` is writable |
 | `401` on every request | `REQUIRE_API_KEY` is not `true`, or the client sends the wrong key | Confirm the env var; use `OMNIROUTE_API_KEY` from `server.env` |
 | Dashboard login rejected | `INITIAL_PASSWORD` was never set, or the `.env` precedence bit | Set `INITIAL_PASSWORD` in `server.env`; the entrypoint exports it so it wins |
+| `qoder` returns `cli_not_found` | The `qodercli` binary is not in the base image | Expected. Only the `runner-cli` image variant ships it, at the cost of a much larger image |
 | OAuth providers return `429` | The upstream account is quota-exhausted | Not a deploy fault — the local instance returns the same. `429` (quota) means the token decrypted fine; `401` would mean it did not |
 | First request hangs ~1 min | The instance was asleep | Expected on a cold start; the keep-alive workflow prevents it |
-| `500` / OOM in the log | 512 MB is too tight | Lower `OMNIROUTE_MEMORY_MB` to `192`, or move to a paid plan |
+| `500` / OOM in the log | 512 MB is too tight | Lower `OMNIROUTE_MEMORY_MB` to `192`, or move to a paid plan. Measured locally: ~385 MB resident at idle |

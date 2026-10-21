@@ -222,24 +222,61 @@ The deploy Dockerfile is a thin layer:
 ```dockerfile
 FROM diegosouzapw/omniroute:3.8.52
 
-# Render secret files are root-owned by default; the image runs as `node`
-# (uid 1000). Grant group 1000 read access (Render docs: Docker secrets).
-USER root
-RUN chgrp -R 1000 /etc/secrets && chmod -R g+r /etc/secrets
-USER node
+COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
 
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+# Starts as ROOT on purpose - see below.
+USER root
+
 ENTRYPOINT ["/app/entrypoint.sh"]
 ```
 
 The upstream image's own `ENTRYPOINT` (`check-permissions.sh`) is replaced
 because the deploy needs to run the restore step *before* the server starts.
-`check-permissions.sh` is preserved in spirit: the entrypoint warns if
-`DATA_DIR` is not writable.
 
 **Version pinning:** `3.8.52`, not `latest`. `latest` tracks the highest
 published stable SemVer and can advance under the service at any time.
+
+#### Why the container starts as root (the most important finding)
+
+Render mounts secret files at `/etc/secrets` **owned by root with mode 0600**,
+so only root can read them. The upstream image runs its server as the
+non-root `node` user (uid 1000). **A container that starts as `node` cannot
+read its own secret files**, and boots with an empty database — a silent,
+green-looking failure (anti-goal A1).
+
+Measured, with a root-owned 0600 mount reproducing Render's exact setup:
+
+| Attempt | Result |
+|---|---|
+| read as uid 1000 | `head: cannot open '/etc/secrets/seed.b64': Permission denied` |
+| `setpriv --reuid=0` from uid 1000 | `setpriv: setresuid failed` — cannot escalate |
+| `chgrp 1000` + `chmod 640` as uid 1000 | fails — cannot chgrp a file you cannot read |
+| start as root, read, then `setpriv` to uid 1000 | **works** |
+
+Render's documented remedy is to make the files group-readable by the
+application's group (group 1000), but that has to be applied to the mount at
+runtime, and a container that starts as `node` cannot change the
+permissions of a root-owned file it cannot read. The mount is also a
+runtime-only tmpfs, so a build-time `chgrp` has no effect on it.
+
+**The solution: a privileged init that drops privileges.** The entrypoint
+starts as root, does the two things that need root (read the secrets, restore
+the seed), then permanently drops to uid 1000 via `setpriv` before exec'ing
+the server. The server process itself never runs as root. This is the
+standard pattern for container entrypoints that must read root-owned
+secrets.
+
+Two smaller Dockerfile details, both found by actually building the image:
+
+- `COPY --chmod=755` rather than `COPY` + `RUN chmod`. A `COPY`'d file is
+  root-owned, and a `RUN chmod` executed as `node` fails with
+  `Operation not permitted`.
+- The image's inherited `NODE_OPTIONS=--max-old-space-size=1024` conflicts
+  with `OMNIROUTE_MEMORY_MB=256` and logs a heap-limit warning on every
+  boot. The entrypoint clears `NODE_OPTIONS` so that `OMNIROUTE_MEMORY_MB`
+  is the only heap control. (Upstream appends `OMNIROUTE_MEMORY_MB` last, so
+  it wins either way — but the warning is noise, and a future upstream
+  change to that ordering would make it matter.)
 
 ### 4.5 Component: the entrypoint
 
@@ -248,26 +285,34 @@ published stable SemVer and can advance under the service at any time.
 set -e
 
 DATA_DIR="${DATA_DIR:-/app/data}"
+SEED_FILE="${SEED_FILE:-/etc/secrets/seed.b64}"
+SERVER_ENV_FILE="${SERVER_ENV_FILE:-/etc/secrets/server.env}"
+APP_UID="${APP_UID:-1000}"
+APP_GID="${APP_GID:-1000}"
+
 mkdir -p "$DATA_DIR"
 
 # 1. Restore the seed DB (present on every cold start).
-if [ -f /etc/secrets/seed.b64 ]; then
+if [ -f "$SEED_FILE" ]; then
   # Remove any prior copy first. A stale storage.sqlite would be silently
   # kept if the restore failed, and a leftover -wal/-shm pair would block the
   # write. (Found by the local spike: a previous instance's -shm/-wal left
   # the restore failing with EACCES and the server booted on stale data.)
   rm -f "$DATA_DIR/storage.sqlite" "$DATA_DIR/storage.sqlite-wal" "$DATA_DIR/storage.sqlite-shm"
-  base64 -d < /etc/secrets/seed.b64 | gunzip > "$DATA_DIR/storage.sqlite"
-  chown node:node "$DATA_DIR/storage.sqlite"
+  base64 -d < "$SEED_FILE" | gunzip > "$DATA_DIR/storage.sqlite"
 fi
 
 # 2. Load the secrets that the DB's encrypted rows require.
-if [ -f /etc/secrets/server.env ]; then
-  set -a; . /etc/secrets/server.env; set +a
+if [ -f "$SERVER_ENV_FILE" ]; then
+  set -a; . "$SERVER_ENV_FILE"; set +a
 fi
 
-# 3. Render injects PORT; single-port mode serves dashboard + API together.
-exec node dev/run-standalone.mjs
+# 3. Drop privileges to `node` and hand off to the server.
+chown -R "$APP_UID:$APP_GID" "$DATA_DIR" 2>/dev/null || true
+exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --clear-groups \
+  env PORT="${PORT:-20128}" DATA_DIR="$DATA_DIR" NODE_ENV=production \
+      HOSTNAME=0.0.0.0 NODE_OPTIONS="" \
+  "$@" node dev/run-standalone.mjs
 ```
 
 **The `rm -f` is not optional.** The local spike caught the failure mode
@@ -276,6 +321,9 @@ present, the restore failed with `Permission denied`, the entrypoint's
 `set -e` aborted the restore, and the server went on to boot against the
 *stale* database — a silent, green-looking failure (anti-goal A1). Removing
 the old files first makes the restore idempotent and self-healing.
+
+**The privilege drop is not optional either** — see §4.4. Without it the
+entrypoint cannot read the secret files at all.
 
 Critical detail: `bootstrap-env.mjs` resolves secrets in the order
 `process.env` > `.env` > `{DATA_DIR}/server.env`, and **auto-generates**
@@ -542,6 +590,32 @@ its sidecars before restoring, which makes the restore idempotent and
 self-healing. This is the exact failure mode anti-goal A1 describes, caught
 by the spike rather than shipped.
 
+**A third finding, and the most important one: the secret-file permission
+problem.** Render mounts secret files root-only readable, and the upstream
+image runs as `node` — so a container started as `node` cannot read them and
+boots with an empty database. The fix (root entrypoint, then a `setpriv`
+drop to uid 1000) is in §4.4. This would have been the deploy's first and
+most confusing failure, and it is invisible without reproducing Render's
+exact file permissions.
+
+**Verified in a real container** (Docker, `diegosouzapw/omniroute:3.8.52`,
+with a root-owned 0600 secret mount reproducing Render's setup exactly):
+
+| Check | Result |
+|---|---|
+| Container build | succeeds; the upstream image is the base, so `/app` and `dev/run-standalone.mjs` are already correct |
+| Boot | `restored seed database (2695168 bytes)` → `loaded 6 secrets` → `dropping privileges to uid 1000` → `Ready` |
+| Container health | `healthy` (Docker's own HEALTHCHECK) |
+| `/healthz` | 200 |
+| `/v1/models` unauthenticated | 401 |
+| `/v1/models` with a migrated key | 200, 1,516 models |
+| `/api/providers` | 200, **all 16 connections** |
+| Dashboard login with `INITIAL_PASSWORD` | 200 |
+| Dashboard login with a wrong password | 401 |
+| Live inference (`agentrouter/deepseek-v4-flash`) | 200, `"content":"PONG"` |
+| Memory | 385 MB resident — fits the 512 MB tier, but with modest headroom |
+| Cold start (container destroyed, fresh ephemeral FS) | rehydrates identically: seed restored, 6 secrets, 16 connections, healthy |
+
 V1–V12 re-validate the same properties on Render's hardware.
 
 ---
@@ -605,33 +679,29 @@ V1–V12 re-validate the same properties on Render's hardware.
 
 Recorded so the next person does not mistake them for oversights.
 
-1. **`tools/upload-secrets.mjs` is not written.** The design and the
-   deployment guide both reference it as the automated path for uploading
-   the two secret files. The manual path (Render dashboard → Secret Files)
-   is fully specified and is the primary path; the script is an automation
-   convenience that still needs writing, and it needs a Render API key
-   whose handling has not been designed.
+1. **The Render service has not been created.** The repo is pushed and
+   ready, and `tools/upload-secrets.mjs` is written and tested, but
+   creating the service needs a Render account: either an API key
+   (`RENDER_API_KEY`) or the dashboard. Neither was available in this
+   environment, so the service, the secret-file upload, and the first
+   deploy are the remaining steps.
 2. **`render.yaml` is not committed.** The Blueprint spec does not support
    `secretFiles`, so a Blueprint can create the service but cannot populate
    the secrets, and the service must be created manually anyway. Committing
    a half-working Blueprint would imply more automation than exists.
-3. **The Docker image has not been built and run.** The `Dockerfile` is
-   written against the published image's documented layout (verified:
-   `dev/run-standalone.mjs` and `build/bootstrap-env.mjs` are both copied
-   into the standalone bundle by upstream's `assembleStandalone.mjs`), and
-   the entrypoint's *logic* was validated end-to-end locally against the
-   real upstream v3.8.51 build. But Docker was not available in this
-   environment, so the container has not been built, the group-1000 secret
-   permission fix has not been exercised, and the `/app` working directory
-   assumption in the `ENTRYPOINT` has not been confirmed against the real
-   image. **V1 is the first check of this, and the first thing to try if the
-   deploy fails.**
-4. **The keep-alive workflow has not been observed working.** The schedule
+3. **The keep-alive workflow has not been observed working.** The schedule
    is standard and the curl is simple, but GitHub disables workflows on the
    first push to a new repository, so it must be enabled manually, and the
    pinger has not been observed preventing a spin-down in practice.
-5. **Render-side behaviour is unverified.** Every constraint in §3.1 comes
-   from Render's documentation, not from an actual deployment. The first
-   deploy is the first real test of the 512 MB ceiling, the ~1 minute cold
-   start, the 1 MB secret-file cap in practice, and the spin-down
-   behaviour.
+4. **Render-side behaviour is unverified.** Every constraint in §3.1 comes
+   from Render's documentation. The container has been built and verified
+   locally (including Render's exact root-owned 0600 secret permissions),
+   but the first deploy is the first real test of the 512 MB ceiling, the
+   ~1 minute cold start, the 1 MB secret-file cap in practice, and the
+   spin-down behaviour.
+5. **Two provider accounts are unusable for reasons unrelated to the
+   deploy.** `qoder` needs a `qodercli` binary that is not in the base
+   image (the `runner-cli` variant has it, at the cost of a much larger
+   image), and `longcat` returns an upstream 402 "Insufficient token
+   quota". Both would need attention before those providers are usable in
+   the cloud. The other 14 connections are unaffected.
