@@ -70,6 +70,24 @@ export const listWorkspaces = () => get("/workspaces");
 export const listOwners = () => get("/owners");
 
 /**
+ * Render's list endpoints return `[{ cursor, service }]` (or
+ * `[{ cursor, owner }]`) rather than bare objects, so unwrap them.
+ */
+export function unwrapList(payload, key) {
+  if (!Array.isArray(payload)) return [];
+  return payload
+    .map((entry) => (entry && typeof entry === "object" && key in entry ? entry[key] : entry))
+    .filter(Boolean);
+}
+
+/** The owner id for the first (usually only) available owner. */
+export async function firstOwnerId() {
+  const owners = unwrapList(await listOwners(), "owner");
+  if (!owners.length) throw new Error("This API key has no accessible Render owners.");
+  return owners[0].id;
+}
+
+/**
  * Find a web service by name, or return null.
  * @param {string} name
  * @param {string} [ownerId] restrict to one owner
@@ -77,9 +95,15 @@ export const listOwners = () => get("/owners");
 export async function findWebService(name, ownerId) {
   const query = new URLSearchParams({ type: "web_service" });
   if (ownerId) query.set("ownerId", ownerId);
-  const services = await get(`/services?${query.toString()}`);
-  const list = Array.isArray(services) ? services : services?.services ?? [];
-  return list.find((s) => s?.name === name) ?? null;
+  const services = unwrapList(await get(`/services?${query.toString()}`), "service");
+  return services.find((s) => s?.name === name) ?? null;
+}
+
+/** List every service visible to the key. */
+export async function listServices(ownerId) {
+  const query = new URLSearchParams();
+  if (ownerId) query.set("ownerId", ownerId);
+  return unwrapList(await get(`/services?${query.toString()}`), "service");
 }
 
 /** Create a web service. */
@@ -110,9 +134,15 @@ export function listEnvVars(serviceId) {
   return get(`/services/${serviceId}/env-vars`);
 }
 
-/** Trigger a deploy of a service. */
+/**
+ * Trigger a deploy of a service.
+ *
+ * The API rejects `clearCache` as a boolean and rejects a body it cannot
+ * parse, so an empty body is the safe form. `clearCache` is not needed for
+ * this deploy: the seed lives in a secret file, not in a build cache.
+ */
 export function triggerDeploy(serviceId, { clearCache } = {}) {
-  return post(`/services/${serviceId}/deploys`, { clearCache: Boolean(clearCache) });
+  return post(`/services/${serviceId}/deploys`, {});
 }
 
 /** Get a deploy by id. */
