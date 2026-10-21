@@ -8,6 +8,8 @@ seed.storage-encryption-key
 trimmed.sqlite
 trimmed.sqlite.gz
 auth-export.json
+.cloud-pass.tmp
+.cloud-key.tmp
 
 node_modules/
 *.log

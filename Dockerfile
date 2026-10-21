@@ -10,18 +10,28 @@
 
 FROM diegosouzapw/omniroute:3.8.52
 
-# Render mounts secret files at /etc/secrets owned by root with mode 0600, so
-# only root can read them. The upstream image runs as `node` (uid/gid 1000).
-# Render's documented fix for a non-root reader is group 1000.
-# https://render.com/docs/docker-secrets
-USER root
-RUN chgrp -R 1000 /etc/secrets 2>/dev/null || true \
- && chmod -R g+r /etc/secrets 2>/dev/null || true
-USER node
-
 # The upstream image's ENTRYPOINT is check-permissions.sh; we replace it with
 # our own because the seed restore must run BEFORE the server starts.
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+#
+# --chmod is used because a COPY'd file is owned by root, and a `RUN chmod`
+# executed as `node` cannot change the mode of a root-owned file.
+COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
+
+# This container starts as ROOT on purpose.
+#
+# Render mounts secret files at /etc/secrets owned by root with mode 0600, so
+# only root can read them. The upstream server runs as the non-root `node`
+# user (uid 1000). A container that starts as `node` cannot read its own
+# secret files and boots with an EMPTY database - a silent, green-looking
+# failure.
+#
+# entrypoint.sh therefore starts as root, reads the secrets and restores the
+# seed, and then permanently drops to uid 1000 for the server process via
+# setpriv. The server itself never runs as root.
+#
+# Verified locally: with root-owned 0600 secret files, a container started as
+# uid 1000 fails with "Permission denied"; the same container started as root
+# reads them and the privilege drop works.
+USER root
 
 ENTRYPOINT ["/app/entrypoint.sh"]
