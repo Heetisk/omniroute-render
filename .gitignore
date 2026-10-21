@@ -1,0 +1,14 @@
+# Build artifacts and secrets - NEVER commit these.
+seed.sqlite
+seed.sqlite.gz
+seed.sqlite.gz.b64
+seed.b64
+seed.server-env
+seed.storage-encryption-key
+trimmed.sqlite
+trimmed.sqlite.gz
+auth-export.json
+
+node_modules/
+*.log
+.DS_Store

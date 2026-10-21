@@ -1,0 +1,56 @@
+name: keepalive
+
+# Render's free tier spins down a web service after 15 minutes without inbound
+# traffic, and the cold start takes about a minute. This workflow pings
+# /healthz every 10 minutes, which keeps the instance warm.
+#
+# 10 minutes against a 15-minute spin-down leaves 5 minutes of slack, so a
+# single missed run (a GitHub Actions hiccup, a delayed job) does not cause a
+# spin-down.
+#
+# This is a mitigation, not a fix: a pinger cannot prevent spin-down during a
+# GitHub Actions outage, and the first request after a missed ping still pays
+# the ~1 minute cold start. See docs/superpowers/specs/2026-10-21-omniroute-render-deployment-design.md
+# section 4.8.
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub's scheduler can drift by a few minutes under
+    # load, which is why the interval is 10 and not 14.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the Render service
+        env:
+          # Set this as a repository secret: Service URL, e.g.
+          # https://omniroute-render.onrender.com
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          if [ -z "$RENDER_URL" ]; then
+            echo "RENDER_URL secret is not set - skipping ping."
+            exit 0
+          fi
+
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            --max-time 60 "$RENDER_URL/healthz" || echo "000")
+
+          echo "GET $RENDER_URL/healthz -> $code"
+
+          if [ "$code" = "200" ]; then
+            echo "Service is warm."
+          else
+            # A non-200 is not a hard failure: the first request after a
+            # spin-down can take up to a minute while the container starts,
+            # and curl may time out during that window. Warn, but do not
+            # fail the run - a failed workflow still counts as a ping for
+            # Render's purposes only if the request was actually delivered.
+            echo "::warning::Health check returned $code - the instance may be cold or restarting."
+          fi
