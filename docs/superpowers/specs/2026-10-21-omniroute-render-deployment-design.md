@@ -598,3 +598,40 @@ V1–V12 re-validate the same properties on Render's hardware.
   with body `{"content": "…"}`.
 - Whether `render.yaml` is committed at all, given `secretFiles` is not
   supported by the Blueprint spec and the service will be created manually.
+
+---
+
+## 12. Known gaps at the time of writing
+
+Recorded so the next person does not mistake them for oversights.
+
+1. **`tools/upload-secrets.mjs` is not written.** The design and the
+   deployment guide both reference it as the automated path for uploading
+   the two secret files. The manual path (Render dashboard → Secret Files)
+   is fully specified and is the primary path; the script is an automation
+   convenience that still needs writing, and it needs a Render API key
+   whose handling has not been designed.
+2. **`render.yaml` is not committed.** The Blueprint spec does not support
+   `secretFiles`, so a Blueprint can create the service but cannot populate
+   the secrets, and the service must be created manually anyway. Committing
+   a half-working Blueprint would imply more automation than exists.
+3. **The Docker image has not been built and run.** The `Dockerfile` is
+   written against the published image's documented layout (verified:
+   `dev/run-standalone.mjs` and `build/bootstrap-env.mjs` are both copied
+   into the standalone bundle by upstream's `assembleStandalone.mjs`), and
+   the entrypoint's *logic* was validated end-to-end locally against the
+   real upstream v3.8.51 build. But Docker was not available in this
+   environment, so the container has not been built, the group-1000 secret
+   permission fix has not been exercised, and the `/app` working directory
+   assumption in the `ENTRYPOINT` has not been confirmed against the real
+   image. **V1 is the first check of this, and the first thing to try if the
+   deploy fails.**
+4. **The keep-alive workflow has not been observed working.** The schedule
+   is standard and the curl is simple, but GitHub disables workflows on the
+   first push to a new repository, so it must be enabled manually, and the
+   pinger has not been observed preventing a spin-down in practice.
+5. **Render-side behaviour is unverified.** Every constraint in §3.1 comes
+   from Render's documentation, not from an actual deployment. The first
+   deploy is the first real test of the 512 MB ceiling, the ~1 minute cold
+   start, the 1 MB secret-file cap in practice, and the spin-down
+   behaviour.
