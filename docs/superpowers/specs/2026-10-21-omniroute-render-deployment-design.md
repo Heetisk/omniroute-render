@@ -618,6 +618,36 @@ with a root-owned 0600 secret mount reproducing Render's setup exactly):
 
 V1–V12 re-validate the same properties on Render's hardware.
 
+### 8.1 Live deployment results (2026-10-21)
+
+Deployed at `https://omniroute-render-a0ci.onrender.com`
+(service `srv-dbc6f4t9fdbs73c1h08g`, plan `free`, region `oregon`).
+
+| # | Check | Result |
+|---|---|---|
+| V1 | Deploy log | `restored seed database` → `loaded 6 secrets` → `dropping privileges to uid 1000` → `Ready` |
+| V2 | `GET /healthz` | 200 `ok` |
+| V3 | `GET /v1/models` unauthenticated | **401** |
+| V4 | `GET /v1/models` with `OMNIROUTE_API_KEY` | 200, **1,562 models** (1,526 before the live catalog finished building; the first request returns 503 `catalog_build_timeout` on a 0.1-CPU instance, then succeeds) |
+| V5 | `GET /v1/models` with a migrated per-client key | 200, 1,562 models |
+| V6 | `GET /api/providers` with the management key | 200, **all 16 connections** |
+| V6b | `GET /api/providers` with a migrated per-client key | 403 — correct, per-client keys have no `manage` scope |
+| V7 | `POST /v1/chat/completions` → `kiro/claude-sonnet-4.5` (OAuth) | **200, `"content":"PONG"`** — a re-encrypted OAuth token decrypting and serving real inference from Render |
+| V8 | `POST /v1/chat/completions` → `codex/gpt-6-astra` (OAuth) | 429 quota-exhausted (the account is out of quota, not broken) |
+| V9 | `POST /v1/chat/completions` → `agentrouter/*` | 502 "Invalid JSON response from provider" — upstream's WAF refuses Render's datacenter IP; the same model works from the local instance |
+| V10 | `POST /v1/chat/completions` → `nvidia/*` | 404 upstream error, identical from both networks |
+| V11 | `POST /v1/chat/completions` → `longcat/*` | 402 upstream "Insufficient token quota" |
+| V12 | `POST /v1/chat/completions` → `qoder/*` | 502 `cli_not_found` — the `qodercli` binary is not in the base image |
+
+The dashboard was verified separately in the local container run: login with
+`INITIAL_PASSWORD` → 200, login with a wrong password → 401.
+
+**The deployment works.** The instance boots from a cold start, enforces
+auth, carries all 16 connections and 5 combos, and serves live inference
+through a credential that was re-encrypted under a deploy-specific key. The
+per-provider failures above are upstream account and IP-reputation issues,
+not deployment faults — and the design anticipated exactly this (§9).
+
 ---
 
 ## 9. Known risks
@@ -679,29 +709,46 @@ V1–V12 re-validate the same properties on Render's hardware.
 
 Recorded so the next person does not mistake them for oversights.
 
-1. **The Render service has not been created.** The repo is pushed and
-   ready, and `tools/upload-secrets.mjs` is written and tested, but
-   creating the service needs a Render account: either an API key
-   (`RENDER_API_KEY`) or the dashboard. Neither was available in this
-   environment, so the service, the secret-file upload, and the first
-   deploy are the remaining steps.
+1. **The GitHub repository is public, not private.** Render's GitHub App is
+   installed on the `hashiramasenjuhit1-oss` account, not on `Heetisk`, and
+   the API key belongs to the Render workspace owned by
+   `hashiramasenjuhit1@gmail.com`. Render refused to create a service
+   against the private `Heetisk/omniroute-render` repo ("repository URL is
+   invalid or unfetchable"), and `Heetisk` cannot create a repo under the
+   other account. The repo was therefore made **public** so Render could
+   clone it. It contains no secrets — the seed, the keys, and the password
+   are all uploaded as Render secret files, and every one of them is
+   git-ignored. Making it private again requires either installing
+   Render's GitHub App on the `Heetisk` account, or moving the repo to
+   `hashiramasenjuhit1-oss`.
 2. **`render.yaml` is not committed.** The Blueprint spec does not support
    `secretFiles`, so a Blueprint can create the service but cannot populate
-   the secrets, and the service must be created manually anyway. Committing
-   a half-working Blueprint would imply more automation than exists.
+   the secrets. The service is now created by `tools/create-service.mjs`
+   instead, which can do both.
 3. **The keep-alive workflow has not been observed working.** The schedule
    is standard and the curl is simple, but GitHub disables workflows on the
    first push to a new repository, so it must be enabled manually, and the
    pinger has not been observed preventing a spin-down in practice.
-4. **Render-side behaviour is unverified.** Every constraint in §3.1 comes
-   from Render's documentation. The container has been built and verified
-   locally (including Render's exact root-owned 0600 secret permissions),
-   but the first deploy is the first real test of the 512 MB ceiling, the
-   ~1 minute cold start, the 1 MB secret-file cap in practice, and the
-   spin-down behaviour.
-5. **Two provider accounts are unusable for reasons unrelated to the
+4. **Two provider accounts are unusable for reasons unrelated to the
    deploy.** `qoder` needs a `qodercli` binary that is not in the base
-   image (the `runner-cli` variant has it, at the cost of a much larger
-   image), and `longcat` returns an upstream 402 "Insufficient token
-   quota". Both would need attention before those providers are usable in
-   the cloud. The other 14 connections are unaffected.
+   image (no `-cli` tag is published on Docker Hub — only base, `-web`,
+   and `-bun`), and `longcat` returns an upstream 402 "Insufficient token
+   quota". Both need attention before those providers are usable in the
+   cloud.
+5. **Some providers refuse Render's datacenter IP.** `agentrouter` returns
+   `unauthorized client detected` / "Invalid JSON response from provider"
+   from Render's egress IP, while the identical request from Heet's home IP
+   succeeds through the local instance. Upstream's WAF fingerprints the
+   client, and a datacenter IP is on its blocklist or fails its
+   heuristic. `nvidia` fails with a 404 from both networks, so that one is
+   an upstream fault. `kiro` (an OAuth provider) works from Render, and
+   `codex` returns 429 quota-exhausted — its account is out of quota, not
+   broken.
+
+   **This is a provider-account property, not a deployment defect.** The
+   instance correctly decrypts the credentials and reaches upstream; some
+   upstreams simply will not serve a Render IP. The practical consequence
+   is that the cloud instance is a *partial* mirror: `kiro` and the
+   `opencode`/`qoder` CLI-backed paths behave differently from the local
+   instance, and the free-tier provider pool is narrower from a datacenter
+   IP than from home.

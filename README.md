@@ -3,6 +3,8 @@
 A 24/7 [Omniroute](https://github.com/diegosouzapw/OmniRoute) gateway on
 Render's free tier, carrying a copy of your local OmniRoute configuration.
 
+**Live at:** https://omniroute-render-a0ci.onrender.com
+
 - **Full setup guide:** [`docs/DEPLOY.md`](docs/DEPLOY.md)
 - **Design document:** [`docs/superpowers/specs/2026-10-21-omniroute-render-deployment-design.md`](docs/superpowers/specs/2026-10-21-omniroute-render-deployment-design.md)
 
@@ -70,7 +72,25 @@ root-owned 0600 secret mount that reproduces Render's exact permissions.
 | Memory | 385 MB resident (fits the 512 MB tier) |
 | **Cold start** (container destroyed, fresh FS) | rehydrates identically |
 
-Two findings from that testing are baked into the code:
+## Live deployment results
+
+Deployed and verified at https://omniroute-render-a0ci.onrender.com:
+
+| Check | Result |
+|---|---|
+| Boot from a cold start | seed restored → 6 secrets → privileges dropped → ready |
+| `/healthz` | 200 |
+| `/v1/models` unauthenticated | **401** |
+| `/v1/models` authenticated | 200, 1,562 models |
+| `/api/providers` (management key) | 200, all 16 connections |
+| **Live inference via a re-encrypted OAuth token** | `kiro/claude-sonnet-4.5` → 200, `"content":"PONG"` |
+
+Some upstream providers refuse Render's datacenter IP or are out of quota —
+`agentrouter` (WAF), `codex` (quota), `longcat` (quota), `qoder` (needs a
+CLI binary not in the base image). Those are provider-account properties,
+not deployment faults. See the design doc §9 and §12 for the detail.
+
+Two findings from testing are baked into the code:
 
 - The container **starts as root** and drops to uid 1000 via `setpriv`.
   Render mounts secret files root-only readable, and the upstream image runs
